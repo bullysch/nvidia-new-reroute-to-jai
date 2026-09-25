@@ -220,6 +220,22 @@ app.post(
         model
       };
 
+      /*
+       * GPT-OSS-20B is a reasoning model.
+       *
+       * JanitorAI needs the actual answer content
+       * from the stream. Force low reasoning so the
+       * model does not consume the entire token budget
+       * on reasoning before producing content.
+       */
+      if (model === "openai/gpt-oss-20b") {
+        upstreamBody.reasoning_effort = "low";
+
+        console.log(
+          "GPT-OSS-20B: forcing reasoning_effort=low"
+        );
+      }
+
       console.log(
         "Request:",
         JSON.stringify({
@@ -227,7 +243,9 @@ app.post(
           stream:
             Boolean(body.stream),
           messageCount:
-            body.messages.length
+            body.messages.length,
+          reasoning_effort:
+            upstreamBody.reasoning_effort || null
         })
       );
 
