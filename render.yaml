@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: janitor-nvidia-proxy
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+
+    envVars:
+      - key: NVIDIA_API_KEY
+        sync: false
+
+      - key: PROXY_API_KEY
+        sync: false
+
+      - key: DEFAULT_MODEL
+        value: openai/gpt-oss-20b
+
+      - key: NVIDIA_BASE_URL
+        value: https://integrate.api.nvidia.com/v1
