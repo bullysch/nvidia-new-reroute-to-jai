@@ -13,7 +13,7 @@ const NVIDIA_BASE_URL =
 
 const DEFAULT_MODEL =
   process.env.DEFAULT_MODEL ||
-  "openai/gpt-oss-20b";
+  "z-ai/glm-5.3";
 
 if (!NVIDIA_API_KEY) {
   console.error("ERROR: NVIDIA_API_KEY is not configured.");
