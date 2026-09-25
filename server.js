@@ -45,6 +45,9 @@ app.use((req, res, next) => {
 
 /*
  * Proxy authentication
+ *
+ * JanitorAI sends PROXY_API_KEY.
+ * The proxy then uses NVIDIA_API_KEY to contact NVIDIA.
  */
 function authenticate(req, res, next) {
   if (!PROXY_API_KEY) {
@@ -67,7 +70,7 @@ function authenticate(req, res, next) {
 }
 
 /*
- * Health checks
+ * Health check
  */
 app.get("/", (req, res) => {
   res.json({
@@ -100,22 +103,34 @@ app.get("/v1/models", authenticate, (req, res) => {
 });
 
 /*
- * Convert NVIDIA's streaming response into a clean
- * OpenAI-compatible SSE stream.
+ * Clean NVIDIA SSE stream.
  *
- * IMPORTANT:
- * NVIDIA may include reasoning-related information.
- * We intentionally forward ONLY:
+ * NVIDIA can send reasoning information such as:
+ *
+ *   reasoning_content
+ *
+ * JanitorAI should receive the actual assistant response,
+ * not the reasoning stream.
+ *
+ * Therefore this function forwards ONLY:
  *
  *   choices[].delta.content
  *
- * and discard reasoning_content.
+ * Everything else is ignored.
  */
 async function proxyStream(upstreamResponse, res) {
   res.status(upstreamResponse.status);
 
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader(
+    "Content-Type",
+    "text/event-stream; charset=utf-8"
+  );
+
+  res.setHeader(
+    "Cache-Control",
+    "no-cache, no-transform"
+  );
+
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
 
@@ -137,308 +152,360 @@ async function proxyStream(upstreamResponse, res) {
         break;
       }
 
-      buffer += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, {
+        stream: true
+      });
 
       /*
-       * NVIDIA sends SSE events separated by blank lines.
+       * SSE events are separated by a blank line.
        */
       const events = buffer.split(/\r?\n\r?\n/);
 
       /*
-       * Keep the final incomplete event for the next chunk.
+       * Keep the final incomplete event for the
+       * next network chunk.
        */
       buffer = events.pop() || "";
 
       for (const event of events) {
-        const lines = event.split(/\r?\n/);
+        /*
+         * Extract only data: lines.
+         */
+        const dataLines = event
+          .split(/\r?\n/)
+          .filter(line => line.startsWith("data:"));
 
-        for (const line of lines) {
-          if (!line.startsWith("data:")) {
-            continue;
-          }
+        if (dataLines.length === 0) {
+          continue;
+        }
 
-          const data = line.slice(5).trim();
+        /*
+         * SSE allows multiple data: lines.
+         */
+        const data = dataLines
+          .map(line => line.slice(5).trimStart())
+          .join("\n")
+          .trim();
 
-          if (!data) {
-            continue;
+        if (!data) {
+          continue;
+        }
+
+        /*
+         * NVIDIA's normal stream termination.
+         */
+        if (data === "[DONE]") {
+          res.write("data: [DONE]\n\n");
+          continue;
+        }
+
+        let json;
+
+        try {
+          json = JSON.parse(data);
+        } catch (error) {
+          /*
+           * Some upstream SSE events may not contain JSON.
+           * Ignore them rather than breaking the entire stream.
+           */
+          console.warn(
+            "Ignoring non-JSON NVIDIA SSE event:",
+            JSON.stringify(data)
+          );
+
+          continue;
+        }
+
+        /*
+         * Process each choice.
+         */
+        for (const choice of json.choices || []) {
+          const delta = choice.delta || {};
+
+          /*
+           * IMPORTANT:
+           *
+           * We intentionally DO NOT forward:
+           *
+           *   delta.reasoning_content
+           *
+           * Only normal assistant content is sent to JanitorAI.
+           */
+          if (
+            typeof delta.content === "string" &&
+            delta.content.length > 0
+          ) {
+            const cleanChunk = {
+              id:
+                json.id ||
+                `chatcmpl-${Date.now()}`,
+
+              object: "chat.completion.chunk",
+
+              created:
+                json.created ||
+                Math.floor(Date.now() / 1000),
+
+              model:
+                json.model ||
+                DEFAULT_MODEL,
+
+              choices: [
+                {
+                  index: choice.index ?? 0,
+
+                  delta: {
+                    content: delta.content
+                  },
+
+                  finish_reason: null
+                }
+              ]
+            };
+
+            res.write(
+              `data: ${JSON.stringify(cleanChunk)}\n\n`
+            );
           }
 
           /*
-           * NVIDIA terminates the stream with [DONE].
+           * Forward the final finish reason.
            */
-          if (data === "[DONE]") {
-            res.write("data: [DONE]\\n\\n");
-            continue;
-          }
+          if (choice.finish_reason) {
+            const finishChunk = {
+              id:
+                json.id ||
+                `chatcmpl-${Date.now()}`,
 
-          let json;
+              object: "chat.completion.chunk",
 
-          try {
-            json = JSON.parse(data);
-          } catch {
-            /*
-             * Ignore malformed/incomplete SSE data.
-             */
-            continue;
-          }
+              created:
+                json.created ||
+                Math.floor(Date.now() / 1000),
 
-          /*
-           * Extract ONLY normal assistant content.
-           */
-          const choices = json.choices || [];
+              model:
+                json.model ||
+                DEFAULT_MODEL,
 
-          for (const choice of choices) {
-            const delta = choice.delta || {};
+              choices: [
+                {
+                  index: choice.index ?? 0,
 
-            /*
-             * Deliberately ignore:
-             *
-             * delta.reasoning_content
-             *
-             * reasoning_content
-             *
-             * other NVIDIA-specific fields.
-             */
-            if (typeof delta.content === "string" && delta.content.length > 0) {
-              const cleanChunk = {
-                id: json.id || `chatcmpl-${Date.now()}`,
-                object: "chat.completion.chunk",
-                created: json.created || Math.floor(Date.now() / 1000),
-                model: json.model || DEFAULT_MODEL,
-                choices: [
-                  {
-                    index: choice.index ?? 0,
-                    delta: {
-                      content: delta.content
-                    },
-                    finish_reason: choice.finish_reason ?? null
-                  }
-                ]
-              };
+                  delta: {},
 
-              res.write(
-                `data: ${JSON.stringify(cleanChunk)}\n\n`
-              );
-            }
+                  finish_reason:
+                    choice.finish_reason
+                }
+              ]
+            };
 
-            /*
-             * Forward the finish signal even if there is no content.
-             */
-            if (choice.finish_reason) {
-              const finishChunk = {
-                id: json.id || `chatcmpl-${Date.now()}`,
-                object: "chat.completion.chunk",
-                created: json.created || Math.floor(Date.now() / 1000),
-                model: json.model || DEFAULT_MODEL,
-                choices: [
-                  {
-                    index: choice.index ?? 0,
-                    delta: {},
-                    finish_reason: choice.finish_reason
-                  }
-                ]
-              };
-
-              res.write(
-                `data: ${JSON.stringify(finishChunk)}\n\n`
-              );
-            }
+            res.write(
+              `data: ${JSON.stringify(finishChunk)}\n\n`
+            );
           }
         }
       }
     }
 
     /*
-     * Process anything left in the buffer.
+     * Flush any remaining decoder data.
      */
-    if (buffer.trim()) {
-      const lines = buffer.split(/\r?\n/);
+    buffer += decoder.decode();
 
-      for (const line of lines) {
-        if (!line.startsWith("data:")) {
-          continue;
-        }
+  } catch (error) {
+    console.error(
+      "Streaming error:",
+      error
+    );
 
-        const data = line.slice(5).trim();
-
-        if (!data || data === "[DONE]") {
-          continue;
-        }
-
-        try {
-          const json = JSON.parse(data);
-
-          for (const choice of json.choices || []) {
-            const delta = choice.delta || {};
-
-            if (
-              typeof delta.content === "string" &&
-              delta.content.length > 0
-            ) {
-              const cleanChunk = {
-                id: json.id || `chatcmpl-${Date.now()}`,
-                object: "chat.completion.chunk",
-                created:
-                  json.created || Math.floor(Date.now() / 1000),
-                model: json.model || DEFAULT_MODEL,
-                choices: [
-                  {
-                    index: choice.index ?? 0,
-                    delta: {
-                      content: delta.content
-                    },
-                    finish_reason: choice.finish_reason ?? null
-                  }
-                ]
-              };
-
-              res.write(
-                `data: ${JSON.stringify(cleanChunk)}\n\n`
-              );
-            }
-          }
-        } catch {
-          // Ignore incomplete trailing data.
-        }
-      }
-    }
-
+  } finally {
     /*
      * Always terminate the OpenAI-compatible stream.
      */
-    res.write("data: [DONE]\n\n");
+    res.write(
+      "data: [DONE]\n\n"
+    );
 
-  } catch (error) {
-    console.error("Streaming error:", error);
-
-  } finally {
     res.end();
   }
 }
 
 /*
- * Main chat completions endpoint
+ * Main chat-completions endpoint
  */
-app.post("/v1/chat/completions", authenticate, async (req, res) => {
-  try {
-    const body = req.body || {};
+app.post(
+  "/v1/chat/completions",
+  authenticate,
+  async (req, res) => {
+    try {
+      const body = req.body || {};
 
-    if (!Array.isArray(body.messages)) {
-      return res.status(400).json({
+      /*
+       * Validate messages.
+       */
+      if (!Array.isArray(body.messages)) {
+        return res.status(400).json({
+          error: {
+            message:
+              "messages must be an array",
+
+            type:
+              "invalid_request_error",
+
+            code:
+              "invalid_messages"
+          }
+        });
+      }
+
+      /*
+       * Use the model supplied by JanitorAI.
+       * Fall back to DEFAULT_MODEL if none was supplied.
+       */
+      const model =
+        body.model ||
+        DEFAULT_MODEL;
+
+      /*
+       * Forward the request to NVIDIA.
+       *
+       * We intentionally don't force a reasoning_effort
+       * value here. JanitorAI's request is preserved.
+       */
+      const upstreamBody = {
+        ...body,
+        model
+      };
+
+      /*
+       * Contact NVIDIA.
+       */
+      const upstreamResponse =
+        await fetch(
+          `${NVIDIA_BASE_URL}/chat/completions`,
+          {
+            method: "POST",
+
+            headers: {
+              "Authorization":
+                `Bearer ${NVIDIA_API_KEY}`,
+
+              "Content-Type":
+                "application/json",
+
+              "Accept":
+                body.stream
+                  ? "text/event-stream"
+                  : "application/json"
+            },
+
+            body:
+              JSON.stringify(
+                upstreamBody
+              )
+          }
+        );
+
+      /*
+       * NVIDIA returned an error.
+       *
+       * Pass the error back to JanitorAI so that
+       * it can display the actual NVIDIA error.
+       */
+      if (!upstreamResponse.ok) {
+        const errorText =
+          await upstreamResponse.text();
+
+        console.error(
+          `NVIDIA returned HTTP ${upstreamResponse.status}:`,
+          errorText
+        );
+
+        res.status(
+          upstreamResponse.status
+        );
+
+        res.setHeader(
+          "Content-Type",
+          upstreamResponse.headers.get(
+            "content-type"
+          ) ||
+            "application/json"
+        );
+
+        return res.send(
+          errorText
+        );
+      }
+
+      /*
+       * STREAMING REQUEST
+       */
+      if (body.stream) {
+        return await proxyStream(
+          upstreamResponse,
+          res
+        );
+      }
+
+      /*
+       * NON-STREAMING REQUEST
+       */
+      const contentType =
+        upstreamResponse.headers.get(
+          "content-type"
+        ) || "";
+
+      const text =
+        await upstreamResponse.text();
+
+      res.status(
+        upstreamResponse.status
+      );
+
+      if (
+        contentType.includes(
+          "application/json"
+        )
+      ) {
+        res.setHeader(
+          "Content-Type",
+          "application/json"
+        );
+
+        return res.send(
+          text
+        );
+      }
+
+      return res.send(
+        text
+      );
+
+    } catch (error) {
+      console.error(
+        "Proxy error:",
+        error
+      );
+
+      return res.status(502).json({
         error: {
-          message: "messages must be an array",
-          type: "invalid_request_error",
-          code: "invalid_messages"
+          message:
+            "Unable to reach NVIDIA API",
+
+          type:
+            "proxy_error",
+
+          code:
+            "upstream_unavailable"
         }
       });
     }
-
-    const model = body.model || DEFAULT_MODEL;
-
-    /*
-     * Copy the request.
-     */
-    const upstreamBody = {
-      ...body,
-      model
-    };
-
-    /*
-     * GPT-OSS supports low/medium/high reasoning effort.
-     *
-     * If JanitorAI doesn't provide one, use LOW rather than
-     * NVIDIA's default MEDIUM. This reduces unnecessary
-     * reasoning tokens and latency.
-     */
-    if (
-      model === "openai/gpt-oss-20b" &&
-      !upstreamBody.reasoning_effort
-    ) {
-      upstreamBody.reasoning_effort = "low";
-    }
-
-    const upstreamResponse = await fetch(
-      `${NVIDIA_BASE_URL}/chat/completions`,
-      {
-        method: "POST",
-
-        headers: {
-          "Authorization": `Bearer ${NVIDIA_API_KEY}`,
-          "Content-Type": "application/json",
-          "Accept": body.stream
-            ? "text/event-stream"
-            : "application/json"
-        },
-
-        body: JSON.stringify(upstreamBody)
-      }
-    );
-
-    /*
-     * If NVIDIA returned an error, pass it through unchanged.
-     */
-    if (!upstreamResponse.ok) {
-      const errorText = await upstreamResponse.text();
-
-      console.error(
-        `NVIDIA returned HTTP ${upstreamResponse.status}:`,
-        errorText
-      );
-
-      res.status(upstreamResponse.status);
-
-      res.setHeader(
-        "Content-Type",
-        upstreamResponse.headers.get("content-type") ||
-          "application/json"
-      );
-
-      return res.send(errorText);
-    }
-
-    /*
-     * Streaming
-     */
-    if (body.stream) {
-      return await proxyStream(upstreamResponse, res);
-    }
-
-    /*
-     * Normal non-streaming request.
-     *
-     * For non-streaming responses, return NVIDIA's JSON.
-     * The response's normal message.content is what JanitorAI
-     * needs.
-     */
-    const contentType =
-      upstreamResponse.headers.get("content-type") || "";
-
-    const text = await upstreamResponse.text();
-
-    res.status(upstreamResponse.status);
-
-    if (contentType.includes("application/json")) {
-      res.setHeader("Content-Type", "application/json");
-      return res.send(text);
-    }
-
-    return res.send(text);
-
-  } catch (error) {
-    console.error("Proxy error:", error);
-
-    return res.status(502).json({
-      error: {
-        message: "Unable to reach NVIDIA API",
-        type: "proxy_error",
-        code: "upstream_unavailable"
-      }
-    });
   }
-});
+);
 
 /*
- * 404
+ * Unknown endpoint
  */
 app.use((req, res) => {
   res.status(404).json({
@@ -452,8 +519,12 @@ app.use((req, res) => {
 /*
  * Start server
  */
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `Janitor NVIDIA proxy listening on port ${PORT}`
-  );
-});
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Janitor NVIDIA proxy listening on port ${PORT}`
+    );
+  }
+);
